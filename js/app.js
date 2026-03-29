@@ -116,9 +116,17 @@ const App = {
         const loadingStatus = document.getElementById('loadingStatus');
 
         try {
+            // Clear cache on manual refresh
+            AirQualityAPI.cache.clear();
+
             const data = await AirQualityAPI.fetchAllCities((pct) => {
-                if (loadingStatus) loadingStatus.textContent = `Loading stations... ${pct}%`;
+                if (loadingStatus) loadingStatus.textContent = `Fetching live station data... ${pct}%`;
             });
+
+            if (!data.length) {
+                if (loadingStatus) loadingStatus.textContent = 'No data received — check network or API status';
+                return;
+            }
 
             // Plot on map
             MapManager.plotCities(data);
@@ -135,10 +143,12 @@ const App = {
             document.getElementById('lastUpdate').textContent =
                 `Updated: ${now.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' })}`;
             document.getElementById('dataAge').textContent =
-                `Last refresh: ${now.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+                `${data.length} stations live | ${now.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
 
         } catch (e) {
             console.error('Failed to load data:', e);
+            const loadingEl = document.getElementById('loadingStatus');
+            if (loadingEl) loadingEl.textContent = `Error: ${e.message}`;
         }
     },
 
@@ -153,16 +163,26 @@ const App = {
         statusEl.textContent = CONFIG.HEALTH_MESSAGES[level].label;
         statusEl.style.color = CONFIG.HEALTH_MESSAGES[level].color;
 
-        // Trend badge (simulated)
+        // Trend badge — compare to previous fetch if available
         const trendEl = document.getElementById('globalAqiTrend');
-        const trendVal = Math.floor(Math.random() * 8) - 4;
-        if (trendVal > 0) {
-            trendEl.textContent = `+${trendVal}%`;
-            trendEl.className = 'metric-card__badge metric-card__badge--up';
+        if (this._prevAvgAqi !== undefined && this._prevAvgAqi > 0) {
+            const diff = stats.avgAqi - this._prevAvgAqi;
+            const pct = Math.round((diff / this._prevAvgAqi) * 100);
+            if (pct > 0) {
+                trendEl.textContent = `+${pct}%`;
+                trendEl.className = 'metric-card__badge metric-card__badge--up';
+            } else if (pct < 0) {
+                trendEl.textContent = `${pct}%`;
+                trendEl.className = 'metric-card__badge metric-card__badge--down';
+            } else {
+                trendEl.textContent = '0%';
+                trendEl.className = 'metric-card__badge';
+            }
         } else {
-            trendEl.textContent = `${trendVal}%`;
+            trendEl.textContent = 'LIVE';
             trendEl.className = 'metric-card__badge metric-card__badge--down';
         }
+        this._prevAvgAqi = stats.avgAqi;
 
         // Station and country count
         document.getElementById('stationCount').textContent = stats.stationCount;

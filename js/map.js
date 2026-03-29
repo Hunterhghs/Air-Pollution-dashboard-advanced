@@ -1,5 +1,5 @@
 /* ============================================
-   Map Module - Leaflet Map Management
+   Map Module - Leaflet Map with WAQI Tile Overlay
    ============================================ */
 
 const MapManager = {
@@ -8,6 +8,7 @@ const MapManager = {
     stationMarkers: [],
     activeLayer: 'aqi',
     tileLayer: null,
+    aqiTileLayer: null,
 
     init() {
         this.map = L.map('map', {
@@ -19,7 +20,7 @@ const MapManager = {
             attributionControl: false,
         });
 
-        // Dark map tiles
+        // Dark base map
         this.tileLayer = L.tileLayer(
             'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
                 subdomains: 'abcd',
@@ -27,23 +28,53 @@ const MapManager = {
             }
         ).addTo(this.map);
 
+        // WAQI real-time AQI tile overlay — this is the official WAQI heatmap
+        // Shows real data from thousands of stations worldwide
+        this._addAqiTileLayer('usepa-aqi');
+
         // Attribution
         L.control.attribution({ position: 'bottomright', prefix: false })
-            .addAttribution('&copy; <a href="https://carto.com/">CARTO</a>')
+            .addAttribution('&copy; <a href="https://carto.com/">CARTO</a> | AQI data &copy; <a href="https://waqi.info/">WAQI</a>')
             .addTo(this.map);
 
         // Events
         this.map.on('moveend', Utils.debounce(() => this.onMapMove(), 500));
 
-        // Layer buttons
+        // Layer buttons — switch between pollutant tile overlays
         document.querySelectorAll('.map-layer-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.querySelectorAll('.map-layer-btn').forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
                 this.activeLayer = btn.dataset.layer;
+                this._switchTileOverlay(btn.dataset.layer);
                 this.updateMarkerColors();
             });
         });
+    },
+
+    _addAqiTileLayer(pollutant) {
+        if (this.aqiTileLayer) {
+            this.map.removeLayer(this.aqiTileLayer);
+        }
+        // WAQI provides free tile layers for different pollutants
+        // Available: usepa-aqi, pm25, pm10, o3, no2, so2, co
+        this.aqiTileLayer = L.tileLayer(
+            `https://tiles.aqicn.org/tiles/${pollutant}/{z}/{x}/{y}.png?token=${CONFIG.WAQI_TOKEN}`, {
+                opacity: 0.45,
+                maxZoom: 18,
+            }
+        ).addTo(this.map);
+    },
+
+    _switchTileOverlay(layer) {
+        const layerMap = {
+            'aqi': 'usepa-aqi',
+            'pm25': 'pm25',
+            'pm10': 'pm10',
+            'o3': 'o3',
+            'no2': 'no2',
+        };
+        this._addAqiTileLayer(layerMap[layer] || 'usepa-aqi');
     },
 
     updateTheme(theme) {
@@ -58,6 +89,11 @@ const MapManager = {
             subdomains: 'abcd',
             maxZoom: 19,
         }).addTo(this.map);
+
+        // Re-add the AQI overlay on top of the new base
+        if (this.aqiTileLayer) {
+            this.aqiTileLayer.bringToFront();
+        }
     },
 
     plotCities(cityData) {
@@ -89,7 +125,7 @@ const MapManager = {
             marker.on('click', () => this.showCityDetail(city));
             marker.on('mouseover', () => {
                 document.getElementById('hoveredCity').textContent =
-                    `${city.name}, ${city.country} — AQI: ${city.aqi} (${CONFIG.HEALTH_MESSAGES[Utils.getAqiLevel(city.aqi)].label})`;
+                    `${city.name}, ${city.country} \u2014 AQI: ${city.aqi} (${CONFIG.HEALTH_MESSAGES[Utils.getAqiLevel(city.aqi)].label}) \u2014 Station: ${city.station}`;
             });
             marker.on('mouseout', () => {
                 document.getElementById('hoveredCity').textContent = 'Hover over a station for details';
@@ -102,7 +138,7 @@ const MapManager = {
 
     async onMapMove() {
         const zoom = this.map.getZoom();
-        if (zoom >= 6) {
+        if (zoom >= 7) {
             const bounds = this.map.getBounds();
             const stations = await AirQualityAPI.fetchMapStations(bounds);
             this.plotStations(stations);
@@ -136,7 +172,7 @@ const MapManager = {
 
             marker.on('mouseover', () => {
                 document.getElementById('hoveredCity').textContent =
-                    `${s.station} — AQI: ${s.aqi}`;
+                    `${s.station} \u2014 AQI: ${s.aqi}`;
             });
             marker.on('mouseout', () => {
                 document.getElementById('hoveredCity').textContent = 'Hover over a station for details';
@@ -159,6 +195,7 @@ const MapManager = {
                         },
                         dominantPollutant: detail.dominentpol || 'pm25',
                         forecast: detail.forecast?.daily || null,
+                        station: detail.city?.name || s.station,
                     });
                 }
             });
@@ -222,20 +259,27 @@ const MapManager = {
         statusEl.textContent = health.label;
         statusEl.style.color = health.color;
 
-        // Pollutant chips
+        // Pollutant chips — only show if we have actual data
         const pollutants = city.pollutants || {};
-        pollutantsEl.innerHTML = Object.entries(pollutants)
-            .filter(([, v]) => v !== null && v !== undefined)
-            .map(([name, value]) => `
-                <div class="pollutant-chip">
-                    <span class="pollutant-chip__name">${name}</span>
-                    <span class="pollutant-chip__value">${value}</span>
-                </div>
-            `).join('');
+        const validPollutants = Object.entries(pollutants).filter(([, v]) => v !== null && v !== undefined);
 
-        healthEl.innerHTML = `<strong>Health Advisory:</strong> ${health.message}`;
+        if (validPollutants.length > 0) {
+            pollutantsEl.innerHTML = validPollutants
+                .map(([name, value]) => `
+                    <div class="pollutant-chip">
+                        <span class="pollutant-chip__name">${name.toUpperCase()}</span>
+                        <span class="pollutant-chip__value">${typeof value === 'number' ? Math.round(value * 10) / 10 : value}</span>
+                    </div>
+                `).join('');
+        } else {
+            pollutantsEl.innerHTML = '<span style="color:var(--text-muted);font-size:11px;">Pollutant breakdown not available for this station</span>';
+        }
 
-        // Draw forecast chart if available
+        // Station source info
+        const stationInfo = city.station ? `<br><small style="color:var(--text-muted)">Source: ${city.station}</small>` : '';
+        healthEl.innerHTML = `<strong>Health Advisory:</strong> ${health.message}${stationInfo}`;
+
+        // Draw chart
         Charts.drawCityForecast(city);
 
         panel.classList.add('active');

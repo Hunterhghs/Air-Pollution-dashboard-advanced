@@ -1,46 +1,107 @@
 /* ============================================
-   API Layer - Data Fetching & Processing
+   API Layer - Real Data from WAQI + OpenAQ
    ============================================ */
 
 const AirQualityAPI = {
     cache: new Map(),
     cityData: [],
+    _seenUids: new Set(),
 
+    /**
+     * Fetch AQI for a single city using the WAQI city-name feed endpoint.
+     * This returns REAL station data even with the demo token.
+     */
     async fetchCityAqi(city) {
-        const cacheKey = `${city.name}-${city.country}`;
+        const cacheKey = city.feed;
         const cached = this.cache.get(cacheKey);
         if (cached && Date.now() - cached.timestamp < 300000) {
             return cached.data;
         }
 
+        // Strategy 1: city name feed (most reliable with demo token)
+        let data = await this._fetchByName(city);
+
+        // Strategy 2: search endpoint if name feed failed
+        if (!data) {
+            data = await this._fetchBySearch(city);
+        }
+
+        if (data) {
+            this.cache.set(cacheKey, { data, timestamp: Date.now() });
+            return data;
+        }
+
+        // Final fallback: no data available for this city
+        console.warn(`No live data for ${city.name} — skipping`);
+        return null;
+    },
+
+    async _fetchByName(city) {
         try {
             const response = await fetch(
-                `${CONFIG.WAQI_BASE}/feed/geo:${city.lat};${city.lng}/?token=${CONFIG.WAQI_TOKEN}`
+                `${CONFIG.WAQI_BASE}/feed/${encodeURIComponent(city.feed)}/?token=${CONFIG.WAQI_TOKEN}`
             );
             const json = await response.json();
 
-            if (json.status === 'ok' && json.data) {
-                const data = this.processStationData(json.data, city);
-                this.cache.set(cacheKey, { data, timestamp: Date.now() });
-                return data;
+            if (json.status === 'ok' && json.data && json.data.aqi !== '-' && json.data.aqi !== undefined) {
+                const aqi = typeof json.data.aqi === 'number' ? json.data.aqi : parseInt(json.data.aqi);
+                if (!isNaN(aqi) && aqi > 0) {
+                    return this._processStationData(json.data, city);
+                }
             }
         } catch (e) {
-            console.warn(`Failed to fetch data for ${city.name}:`, e.message);
+            console.warn(`Name feed failed for ${city.name}:`, e.message);
         }
-
-        // Return simulated data as fallback
-        return this.generateFallbackData(city);
+        return null;
     },
 
-    processStationData(raw, city) {
+    async _fetchBySearch(city) {
+        try {
+            const response = await fetch(
+                `${CONFIG.WAQI_BASE}/search/?keyword=${encodeURIComponent(city.name)}&token=${CONFIG.WAQI_TOKEN}`
+            );
+            const json = await response.json();
+
+            if (json.status === 'ok' && json.data && json.data.length > 0) {
+                // Pick the first result that has a valid AQI
+                for (const result of json.data) {
+                    const aqi = parseInt(result.aqi);
+                    if (!isNaN(aqi) && aqi > 0) {
+                        return {
+                            name: city.name,
+                            country: city.country,
+                            lat: city.lat,
+                            lng: city.lng,
+                            pop: city.pop,
+                            aqi,
+                            pollutants: {}, // search endpoint doesn't provide individual pollutants
+                            dominantPollutant: 'pm25',
+                            time: result.time?.stime || new Date().toISOString(),
+                            station: result.station?.name || city.name,
+                            uid: result.uid,
+                            forecast: null,
+                            _needsDetail: true, // flag to fetch full detail later
+                        };
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`Search failed for ${city.name}:`, e.message);
+        }
+        return null;
+    },
+
+    _processStationData(raw, city) {
         const iaqi = raw.iaqi || {};
+        const aqi = typeof raw.aqi === 'number' ? raw.aqi : parseInt(raw.aqi);
+
         return {
             name: city.name,
             country: city.country,
             lat: city.lat,
             lng: city.lng,
             pop: city.pop,
-            aqi: typeof raw.aqi === 'number' ? raw.aqi : parseInt(raw.aqi) || 0,
+            aqi: isNaN(aqi) ? 0 : aqi,
             pollutants: {
                 pm25: iaqi.pm25?.v ?? null,
                 pm10: iaqi.pm10?.v ?? null,
@@ -49,82 +110,105 @@ const AirQualityAPI = {
                 so2: iaqi.so2?.v ?? null,
                 co: iaqi.co?.v ?? null,
             },
-            dominantPollutant: raw.dominentpol || 'pm25',
-            time: raw.time?.s || new Date().toISOString(),
+            dominantPollutant: raw.dominentpol || this._inferDominant(iaqi),
+            time: raw.time?.s || raw.time?.iso || new Date().toISOString(),
             station: raw.city?.name || city.name,
+            uid: raw.idx,
             forecast: raw.forecast?.daily || null,
         };
     },
 
-    generateFallbackData(city) {
-        // Generate realistic AQI based on known pollution patterns
-        const baseAqi = this.getRegionalBaseAqi(city.country);
-        const variation = Math.floor(Math.random() * 40) - 20;
-        const aqi = Math.max(5, baseAqi + variation);
-        const pm25 = Math.round(aqi * (0.8 + Math.random() * 0.4));
-        const pm10 = Math.round(pm25 * (1.2 + Math.random() * 0.6));
-
-        return {
-            name: city.name,
-            country: city.country,
-            lat: city.lat,
-            lng: city.lng,
-            pop: city.pop,
-            aqi,
-            pollutants: {
-                pm25,
-                pm10,
-                o3: Math.round(20 + Math.random() * 40),
-                no2: Math.round(10 + Math.random() * 30),
-                so2: Math.round(2 + Math.random() * 15),
-                co: Math.round(2 + Math.random() * 8) / 10,
-            },
-            dominantPollutant: aqi > 100 ? 'pm25' : (Math.random() > 0.5 ? 'pm25' : 'o3'),
-            time: new Date().toISOString(),
-            station: city.name,
-            forecast: null,
-        };
+    _inferDominant(iaqi) {
+        let max = 0;
+        let dominant = 'pm25';
+        for (const [key, obj] of Object.entries(iaqi)) {
+            const v = obj?.v ?? 0;
+            if (v > max) {
+                max = v;
+                dominant = key.replace('.', '');
+            }
+        }
+        return dominant;
     },
 
-    getRegionalBaseAqi(country) {
-        const highPollution = ['India', 'Pakistan', 'Bangladesh', 'Nepal', 'Mongolia'];
-        const medHighPollution = ['China', 'Indonesia', 'Vietnam', 'Egypt', 'Nigeria', 'Ghana', 'Ethiopia'];
-        const medPollution = ['Thailand', 'Turkey', 'Mexico', 'Peru', 'Colombia', 'Philippines', 'Malaysia', 'Saudi Arabia', 'UAE'];
-        const lowPollution = ['Japan', 'South Korea', 'Taiwan', 'Singapore', 'Australia', 'Canada', 'Netherlands'];
-
-        if (highPollution.includes(country)) return 160 + Math.floor(Math.random() * 60);
-        if (medHighPollution.includes(country)) return 100 + Math.floor(Math.random() * 50);
-        if (medPollution.includes(country)) return 60 + Math.floor(Math.random() * 40);
-        if (lowPollution.includes(country)) return 25 + Math.floor(Math.random() * 25);
-        return 40 + Math.floor(Math.random() * 40);
-    },
-
+    /**
+     * Fetch all configured cities with real API data.
+     * Uses batching with delays to respect rate limits.
+     */
     async fetchAllCities(onProgress) {
         const cities = CONFIG.MAJOR_CITIES;
         const results = [];
-        const batchSize = 8;
+        const batchSize = 5; // smaller batches to avoid rate limits
+        this._seenUids.clear();
 
         for (let i = 0; i < cities.length; i += batchSize) {
             const batch = cities.slice(i, i + batchSize);
-            const batchResults = await Promise.all(
+            const batchResults = await Promise.allSettled(
                 batch.map(city => this.fetchCityAqi(city))
             );
-            results.push(...batchResults);
 
-            if (onProgress) {
-                onProgress(Math.round((results.length / cities.length) * 100));
+            for (const result of batchResults) {
+                if (result.status === 'fulfilled' && result.value) {
+                    // De-duplicate by UID (some cities may resolve to same station)
+                    const d = result.value;
+                    if (d.uid && this._seenUids.has(d.uid)) continue;
+                    if (d.uid) this._seenUids.add(d.uid);
+                    results.push(d);
+                }
             }
 
-            // Small delay between batches to avoid rate limiting
+            if (onProgress) {
+                onProgress(Math.round(((i + batch.length) / cities.length) * 100));
+            }
+
+            // Rate-limit delay between batches
             if (i + batchSize < cities.length) {
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, 350));
+            }
+        }
+
+        // Enrich any results that only have AQI (from search endpoint) with full detail
+        const needsDetail = results.filter(r => r._needsDetail && r.uid);
+        if (needsDetail.length > 0) {
+            const detailBatches = [];
+            for (let i = 0; i < needsDetail.length; i += 4) {
+                detailBatches.push(needsDetail.slice(i, i + 4));
+            }
+            for (const batch of detailBatches) {
+                await Promise.allSettled(batch.map(async (city) => {
+                    const detail = await this.fetchStationDetail(city.uid);
+                    if (detail) {
+                        const iaqi = detail.iaqi || {};
+                        city.pollutants = {
+                            pm25: iaqi.pm25?.v ?? null,
+                            pm10: iaqi.pm10?.v ?? null,
+                            o3: iaqi.o3?.v ?? null,
+                            no2: iaqi.no2?.v ?? null,
+                            so2: iaqi.so2?.v ?? null,
+                            co: iaqi.co?.v ?? null,
+                        };
+                        city.dominantPollutant = detail.dominentpol || this._inferDominant(iaqi);
+                        city.forecast = detail.forecast?.daily || null;
+                        delete city._needsDetail;
+                    }
+                }));
+                await new Promise(r => setTimeout(r, 300));
             }
         }
 
         this.cityData = results.filter(r => r && r.aqi > 0);
+
+        // Sort by AQI descending for debugging
+        console.log(`Loaded ${this.cityData.length} cities with live AQI data`);
+        console.table(this.cityData.map(c => ({ city: c.name, aqi: c.aqi, station: c.station })));
+
         return this.cityData;
     },
 
+    /**
+     * Fetch stations within map bounds (for zoomed-in views).
+     * Uses WAQI map bounds API.
+     */
     async fetchMapStations(bounds) {
         try {
             const { _southWest: sw, _northEast: ne } = bounds;
@@ -133,35 +217,43 @@ const AirQualityAPI = {
             const json = await response.json();
 
             if (json.status === 'ok' && json.data) {
-                return json.data.map(s => ({
-                    lat: s.lat,
-                    lng: s.lon,
-                    aqi: parseInt(s.aqi) || 0,
-                    station: s.station?.name || 'Unknown',
-                    uid: s.uid,
-                })).filter(s => s.aqi > 0);
+                return json.data
+                    .map(s => ({
+                        lat: s.lat,
+                        lng: s.lon,
+                        aqi: parseInt(s.aqi) || 0,
+                        station: s.station?.name || 'Unknown',
+                        uid: s.uid,
+                    }))
+                    .filter(s => s.aqi > 0 && !isNaN(s.aqi));
             }
         } catch (e) {
-            console.warn('Failed to fetch map stations:', e.message);
+            console.warn('Map bounds fetch failed:', e.message);
         }
         return [];
     },
 
+    /**
+     * Fetch detailed data for a single station by UID.
+     */
     async fetchStationDetail(uid) {
         try {
             const response = await fetch(
                 `${CONFIG.WAQI_BASE}/feed/@${uid}/?token=${CONFIG.WAQI_TOKEN}`
             );
             const json = await response.json();
-            if (json.status === 'ok') {
+            if (json.status === 'ok' && json.data) {
                 return json.data;
             }
         } catch (e) {
-            console.warn('Failed to fetch station detail:', e.message);
+            console.warn('Station detail fetch failed:', e.message);
         }
         return null;
     },
 
+    /**
+     * Compute dashboard statistics from loaded city data.
+     */
     getStatistics() {
         const data = this.cityData;
         if (!data.length) return null;
@@ -176,9 +268,18 @@ const AirQualityAPI = {
         // Dominant pollutant distribution
         const pollutantCounts = { pm25: 0, pm10: 0, o3: 0, no2: 0, so2: 0, co: 0 };
         data.forEach(d => {
-            const dom = d.dominantPollutant?.replace('.', '') || 'pm25';
-            if (pollutantCounts.hasOwnProperty(dom)) {
-                pollutantCounts[dom]++;
+            // Use actual highest pollutant value, not just the reported dominant
+            const p = d.pollutants || {};
+            let maxKey = 'pm25';
+            let maxVal = 0;
+            for (const [key, val] of Object.entries(p)) {
+                if (val !== null && val > maxVal) {
+                    maxVal = val;
+                    maxKey = key;
+                }
+            }
+            if (pollutantCounts.hasOwnProperty(maxKey)) {
+                pollutantCounts[maxKey]++;
             } else {
                 pollutantCounts.pm25++;
             }
@@ -213,6 +314,9 @@ const AirQualityAPI = {
         };
     },
 
+    /**
+     * Generate health advisories based on current data.
+     */
     getHealthAdvisories() {
         const data = this.cityData;
         const advisories = [];
@@ -225,7 +329,7 @@ const AirQualityAPI = {
             advisories.push({
                 icon: '\u26a0\ufe0f',
                 title: `Hazardous Air in ${hazardous.length} ${hazardous.length === 1 ? 'city' : 'cities'}`,
-                text: `${hazardous.map(c => c.name).join(', ')} — avoid outdoor activity, use air purifiers indoors.`,
+                text: `${hazardous.map(c => c.name).join(', ')} \u2014 avoid outdoor activity, use air purifiers indoors.`,
                 severity: 'hazardous'
             });
         }
@@ -234,7 +338,7 @@ const AirQualityAPI = {
             advisories.push({
                 icon: '\ud83d\udfe3',
                 title: `Very Unhealthy: ${veryUnhealthy.length} ${veryUnhealthy.length === 1 ? 'city' : 'cities'}`,
-                text: `${veryUnhealthy.map(c => c.name).join(', ')} — health alert for entire population.`,
+                text: `${veryUnhealthy.map(c => c.name).join(', ')} \u2014 health alert for entire population.`,
                 severity: 'very-unhealthy'
             });
         }
@@ -243,8 +347,18 @@ const AirQualityAPI = {
             advisories.push({
                 icon: '\ud83d\udfe0',
                 title: `Unhealthy: ${unhealthy.length} ${unhealthy.length === 1 ? 'city' : 'cities'}`,
-                text: `Sensitive groups should limit prolonged outdoor exertion.`,
+                text: `${unhealthy.slice(0, 5).map(c => c.name).join(', ')}${unhealthy.length > 5 ? ' and more' : ''} \u2014 sensitive groups should limit prolonged outdoor exertion.`,
                 severity: 'unhealthy'
+            });
+        }
+
+        const usg = data.filter(d => d.aqi > 100 && d.aqi <= 150);
+        if (usg.length) {
+            advisories.push({
+                icon: '\ud83d\udfe1',
+                title: `Sensitive Groups Alert: ${usg.length} cities`,
+                text: `Children, elderly, and those with respiratory conditions should take precautions.`,
+                severity: 'usg'
             });
         }
 
@@ -262,7 +376,7 @@ const AirQualityAPI = {
             advisories.push({
                 icon: '\u2139\ufe0f',
                 title: 'No active advisories',
-                text: 'Monitoring all stations. Data refreshes every 5 minutes.',
+                text: 'Monitoring all stations. Data refreshes automatically.',
                 severity: 'info'
             });
         }
